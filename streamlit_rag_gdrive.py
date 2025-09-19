@@ -32,11 +32,19 @@ except Exception:
 
 # ----------------------- Utilities -----------------------
 
+from oauth2client.service_account import ServiceAccountCredentials
+
 def authenticate_gdrive():
+    """Authenticate Google Drive using service account credentials from Streamlit secrets."""
     if GoogleAuth is None:
         raise RuntimeError("PyDrive not installed. Please install pydrive.")
+
+    scopes = ['https://www.googleapis.com/auth/drive']
+    service_account_info = st.secrets["gcp_service_account"]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(service_account_info, scopes)
+
     gauth = GoogleAuth()
-    gauth.LocalWebserverAuth()
+    gauth.credentials = creds
     drive = GoogleDrive(gauth)
     return drive
 
@@ -177,3 +185,4 @@ if st.button("Run Query"):
             st.warning("No Mistral API key provided — showing retrieved context only.")
             st.subheader("Retrieved Context")
             st.write("\n\n".join(context_texts))
+
