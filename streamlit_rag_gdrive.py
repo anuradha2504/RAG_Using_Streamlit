@@ -1,13 +1,13 @@
 # streamlit_rag_gdrive.py
-# Streamlit app: Domain-specific RAG using MistralAI with Google Drive document ingestion
+# Streamlit app: Domain-specific RAG using MistralAI with Google Drive document ingestion (Service Account Auth)
 
 import os
-import tempfile
 import streamlit as st
 import numpy as np
-import json
 from typing import List, Tuple
+import json
 
+# ----------------------- Optional Imports -----------------------
 try:
     from sentence_transformers import SentenceTransformer
 except Exception:
@@ -26,20 +26,21 @@ except Exception:
 try:
     from pydrive.auth import GoogleAuth
     from pydrive.drive import GoogleDrive
+    from oauth2client.service_account import ServiceAccountCredentials
 except Exception:
     GoogleAuth = None
     GoogleDrive = None
+    ServiceAccountCredentials = None
 
 # ----------------------- Utilities -----------------------
 
-from oauth2client.service_account import ServiceAccountCredentials
-
 def authenticate_gdrive():
     """Authenticate Google Drive using service account credentials from Streamlit secrets."""
-    if GoogleAuth is None:
-        raise RuntimeError("PyDrive not installed. Please install pydrive.")
+    if GoogleAuth is None or ServiceAccountCredentials is None:
+        raise RuntimeError("PyDrive or oauth2client not installed. Please install them.")
 
     scopes = ['https://www.googleapis.com/auth/drive']
+    # Read service account credentials from Streamlit secrets
     service_account_info = st.secrets["gcp_service_account"]
     creds = ServiceAccountCredentials.from_json_keyfile_dict(service_account_info, scopes)
 
@@ -102,17 +103,18 @@ def call_mistral(api_key, prompt, model="mistral-medium"):
 # ----------------------- Streamlit UI -----------------------
 
 st.set_page_config(page_title="Domain-specific RAG (GDrive + Mistral)", layout="wide")
-st.title("Domain-specific RAG — Google Drive + MistralAI")
+st.title("📑 Domain-specific RAG — Google Drive + MistralAI")
 
 with st.sidebar:
-    st.header("Configuration")
+    st.header("⚙️ Configuration")
     MISTRAL_KEY = st.text_input("Mistral API Key", type="password")
     top_k = st.number_input("Top-k retrieved chunks", min_value=1, max_value=10, value=4)
     chunk_size = st.number_input("Chunk size", min_value=200, max_value=2000, value=600)
     overlap = st.number_input("Chunk overlap", min_value=0, max_value=400, value=100)
     folder_id = st.text_input("Google Drive Folder ID")
-    gdrive_fetch = st.button("Fetch Documents from Google Drive")
+    gdrive_fetch = st.button("📥 Fetch Documents from Google Drive")
 
+# --------- Fetch Docs ---------
 if gdrive_fetch:
     try:
         drive = authenticate_gdrive()
@@ -120,12 +122,13 @@ if gdrive_fetch:
         if len(raw_docs) < 4:
             st.error("Less than 4 documents found. Add more files to the folder.")
         else:
-            st.success(f"Fetched {len(raw_docs)} documents from Google Drive.")
+            st.success(f"✅ Fetched {len(raw_docs)} documents from Google Drive.")
             st.session_state['raw_docs'] = raw_docs
     except Exception as e:
-        st.error(f"Google Drive fetch failed: {e}")
+        st.error(f"❌ Google Drive fetch failed: {e}")
 
-if st.button("Ingest and Build Index"):
+# --------- Build Index ---------
+if st.button("⚡ Ingest and Build Index"):
     if 'raw_docs' not in st.session_state or len(st.session_state['raw_docs']) < 4:
         st.error("Please fetch at least 4 documents first.")
     else:
@@ -144,14 +147,15 @@ if st.button("Ingest and Build Index"):
             st.session_state['embs'] = embs
             index = build_faiss_index(embs)
             st.session_state['index'] = index
-            st.success(f"Built FAISS index with {len(chunks)} chunks.")
+            st.success(f"✅ Built FAISS index with {len(chunks)} chunks.")
         except Exception as e:
-            st.error(f"Embedding/Indexing error: {e}")
+            st.error(f"❌ Embedding/Indexing error: {e}")
 
-st.header("Query")
+# --------- Query Section ---------
+st.header("🔎 Query")
 query = st.text_input("Enter your question")
 
-if st.button("Run Query"):
+if st.button("▶️ Run Query"):
     if 'index' not in st.session_state:
         st.error("No index found. Fetch and ingest documents first.")
     elif not query:
@@ -175,14 +179,13 @@ if st.button("Run Query"):
 
         if MISTRAL_KEY:
             try:
-                with st.spinner("Calling MistralAI..."):
+                with st.spinner("🤖 Calling MistralAI..."):
                     answer = call_mistral(MISTRAL_KEY, prompt)
-                st.subheader("Answer")
+                st.subheader("💡 Answer")
                 st.write(answer)
             except Exception as e:
-                st.error(f"Mistral API error: {e}")
+                st.error(f"❌ Mistral API error: {e}")
         else:
-            st.warning("No Mistral API key provided — showing retrieved context only.")
+            st.warning("⚠️ No Mistral API key provided — showing retrieved context only.")
             st.subheader("Retrieved Context")
             st.write("\n\n".join(context_texts))
-
