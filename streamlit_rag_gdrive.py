@@ -1,124 +1,181 @@
-import streamlit as st
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-from google.oauth2.service_account import Credentials
+# streamlit_rag_gdrive.py
+
+import os
 import io
+import streamlit as st
+import numpy as np
+from typing import List, Tuple
+import json
+
+# Libraries for reading files
 import docx2txt
 import PyPDF2
-import tempfile
+
+# Google auth
+from pydrive2.auth import GoogleAuth
+from pydrive2.drive import GoogleDrive
+from google.oauth2.service_account import Credentials
+
+# Optional imports
+try:
+    from sentence_transformers import SentenceTransformer
+except:
+    SentenceTransformer = None
+try:
+    import faiss
+except:
+    faiss = None
+try:
+    from mistralai import Mistral
+except:
+    Mistral = None
 
 
+# ---------------- AUTH FUNCTION ---------------- #
 def authenticate_gdrive():
-    scopes = ['https://www.googleapis.com/auth/drive.readonly']
-    credentials = Credentials.from_service_account_file(
-        'service_account.json',
-        scopes=scopes
+    creds_json = st.secrets["gcp_service_account"]
+    creds = Credentials.from_service_account_info(
+        creds_json,
+        scopes=['https://www.googleapis.com/auth/drive']
     )
-    return build('drive', 'v3', credentials=credentials)
+
+    gauth = GoogleAuth()
+    gauth.credentials = creds
+    drive = GoogleDrive(gauth)
+    return drive
 
 
-def extract_pdf(file_bytes):
-    try:
-        reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text() or ""
-        return text
-    except:
-        return ""
+# ---------------- FETCH FUNCTION ---------------- #
+def extract_text_from_file(drive_file):
+    mime = drive_file['mimeType']
+
+    if mime == "application/vnd.google-apps.document":
+        txt = drive_file.GetContentString()
+        return txt
+
+    content = drive_file.GetContentFile(drive_file['title'])
+    filename = drive_file['title']
+
+    if filename.lower().endswith(".pdf"):
+        with open(filename, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            text = ""
+            for page in reader.pages:
+                text += page.extract_text() or ""
+    elif filename.lower().endswith(".docx"):
+        text = docx2txt.process(filename)
+    elif filename.lower().endswith(".txt"):
+        text = drive_file.GetContentString()
+    else:
+        return None
+
+    return text
 
 
-def extract_docx(file_bytes):
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
-            tmp.write(file_bytes)
-            tmp_path = tmp.name
-        text = docx2txt.process(tmp_path)
-        return text
-    except:
-        return ""
-
-
-def fetch_gdrive_files(drive, folder_id):
+def fetch_gdrive_files(drive, folder_id, max_files=15):
     query = f"'{folder_id}' in parents and trashed=false"
-    results = drive.files().list(q=query, fields="files(id, name, mimeType)").execute()
-    items = results.get('files', [])
+    file_list = drive.ListFile({'q': query}).GetList()
 
     docs = []
-
-    for f in items:
-        file_id = f['id']
-        name = f['name']
-        mime = f['mimeType']
-
-        try:
-            # Google Docs Export
-            if mime == "application/vnd.google-apps.document":
-                request = drive.files().export_media(fileId=file_id,
-                                                     mimeType='text/plain')
-                file_bytes = request.execute()
-                docs.append({"name": name, "text": file_bytes.decode("utf-8")})
-            
-            # Google Sheets Export
-            elif mime == "application/vnd.google-apps.spreadsheet":
-                request = drive.files().export_media(fileId=file_id,
-                                                     mimeType="text/csv")
-                file_bytes = request.execute()
-                docs.append({"name": name, "text": file_bytes.decode("utf-8")})
-
-            # Google Slides Export (as text)
-            elif mime == "application/vnd.google-apps.presentation":
-                request = drive.files().export_media(fileId=file_id,
-                                                     mimeType="text/plain")
-                file_bytes = request.execute()
-                docs.append({"name": name, "text": file_bytes.decode("utf-8")})
-
-            # PDF / DOCX / TXT Download
-            else:
-                request = drive.files().get_media(fileId=file_id)
-                fh = io.BytesIO()
-                downloader = MediaIoBaseDownload(fh, request)
-                done = False
-                while not done:
-                    status, done = downloader.next_chunk()
-                
-                content = fh.getvalue()
-
-                if mime == "application/pdf":
-                    text = extract_pdf(content)
-                elif mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-                    text = extract_docx(content)
-                elif mime == "text/plain":
-                    text = content.decode("utf-8", errors="ignore")
-                else:
-                    text = ""  # unsupported
-
-                if text.strip():
-                    docs.append({"name": name, "text": text})
-
-        except Exception as e:
-            st.warning(f"⚠️ Failed reading {name}: {e}")
+    for f in file_list[:max_files]:
+        text = extract_text_from_file(f)
+        if text:
+            docs.append((f['title'], text))
 
     return docs
 
 
-# --------- Streamlit UI ---------
-st.title("📂 Google Drive Document Loader")
+# --------------- RAG UTILITIES ---------------- #
+def chunk_text(text, chunk_size=600, overlap=100):
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start = max(end - overlap, end)
+    return chunks
 
-folder_id = st.text_input("Enter Google Drive Folder ID")
 
-if st.button("Fetch Files"):
+def compute_embeddings(texts, model_name="all-MiniLM-L6-v2"):
+    if SentenceTransformer is None:
+        raise RuntimeError("Install sentence-transformers")
+    model = SentenceTransformer(model_name)
+    embs = model.encode(texts, convert_to_numpy=True)
+    return embs.astype(np.float32)
+
+
+def build_faiss_index(embs):
+    if faiss is None:
+        raise RuntimeError("Install faiss-cpu")
+    d = embs.shape[1]
+    index = faiss.IndexFlatL2(d)
+    index.add(embs)
+    return index
+
+
+def query_index(index, q_emb, top_k):
+    distances, indices = index.search(q_emb, top_k)
+    return distances, indices
+
+
+# ---------------- STREAMLIT UI ---------------- #
+st.title("📑 Domain RAG — Google Drive")
+
+with st.sidebar:
+    st.header("⚙ Settings")
+    MISTRAL_KEY = st.text_input("Mistral API Key", type="password")
+    top_k = st.number_input("Top K", 1, 10, 4)
+    chunk_size = st.number_input("Chunk Size", 200, 2000, 600)
+    overlap = st.number_input("Overlap", 0, 400, 100)
+    folder_id = st.text_input("Google Drive Folder ID")
+
+    fetch_btn = st.button("📥 Fetch Docs")
+
+if fetch_btn:
     try:
         drive = authenticate_gdrive()
         docs = fetch_gdrive_files(drive, folder_id)
 
-        if len(docs) == 0:
-            st.error("❌ No readable docs found! Add Google Docs / PDF / TXT / DOCX etc.")
+        if not docs:
+            st.error("❌ No readable docs found! Ensure sharing & file types (PDF/DOCX/TXT/Google Docs)")
         else:
-            st.success(f"✅ Fetched & extracted {len(docs)} readable documents!")
-            st.session_state["raw_docs"] = docs
-            for d in docs:
-                st.write(f"📄 {d['name']} - {len(d['text'])} characters")
-
+            st.session_state["docs"] = docs
+            st.success(f"Fetched {len(docs)} files ✔")
     except Exception as e:
-        st.error(f"❌ Error: {e}")
+        st.error(f"❌ {e}")
+
+
+if st.button("⚡ Build Index"):
+    if "docs" not in st.session_state:
+        st.error("Fetch documents first")
+    else:
+        chunks, meta = [], []
+        for title, text in st.session_state["docs"]:
+            for i, c in enumerate(chunk_text(text, chunk_size, overlap)):
+                chunks.append(c)
+                meta.append({"title": title, "chunk": i})
+
+        st.session_state["chunks"] = chunks
+        st.session_state["meta"] = meta
+        embs = compute_embeddings(chunks)
+        st.session_state["embs"] = embs
+        st.session_state["index"] = build_faiss_index(embs)
+
+        st.success("Index built!")
+
+
+st.header("🔍 Ask a Question")
+query = st.text_input("Your query")
+ask_btn = st.button("Ask")
+
+if ask_btn:
+    if "index" not in st.session_state:
+        st.error("No index")
+    else:
+        q_emb = compute_embeddings([query])
+        distances, idxs = query_index(st.session_state["index"], q_emb, top_k)
+
+        answers = []
+        for i in idxs[0]:
+            st.write(f"📌 From: {st.session_state['meta'][i]['title']}")
+            st.code(st.session_state["chunks"][i][:800])
