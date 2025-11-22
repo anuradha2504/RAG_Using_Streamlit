@@ -115,22 +115,54 @@ with st.sidebar:
     gdrive_fetch = st.button("📥 Fetch Documents from Google Drive")
 
 # --------- Fetch Docs ---------
-if gdrive_fetch:
-    try:
-        drive = authenticate_gdrive()
-        raw_docs = fetch_gdrive_files(drive, folder_id)
+def fetch_gdrive_files(drive, folder_id: str, max_files=10):
+    """Fetch and extract text content from most common file types in Google Drive folder."""
+    file_list = drive.ListFile({'q': f"'{folder_id}' in parents and trashed=false"}).GetList()
+    
+    docs = []
+    for f in file_list[:max_files]:
+        file_id = f['id']
+        file_name = f['title']
+        mime = f['mimeType']
 
-        if len(raw_docs) == 0:
-            st.error("❌ No documents found in the folder. Please add at least one file.")
-        else:
-            st.success(f"✅ Fetched {len(raw_docs)} document(s) from Google Drive.")
-            st.session_state['raw_docs'] = raw_docs
+        try:
+            # Case 1: Google Docs (convert directly to text)
+            if mime == 'application/vnd.google-apps.document':
+                content = f.GetContentString()
+                docs.append((file_name, content))
+                continue
 
-            if len(raw_docs) < 2:
-                st.warning("⚠️ Only one document found. Recommendation: Add more files for better RAG performance.")
+            # Case 2: Plain text / Markdown / CSV etc.
+            if mime.startswith("text/") or mime == "application/json":
+                content = f.GetContentString()
+                docs.append((file_name, content))
+                continue
 
-    except Exception as e:
-        st.error(f"❌ Google Drive fetch failed: {e}")
+            # Case 3: PDF extraction
+            if mime == "application/pdf":
+                content = f.GetContentString(mimetype='text/plain')
+                if content.strip():
+                    docs.append((file_name, content))
+                continue
+
+            # Case 4: Word (.docx)
+            if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+                content = f.GetContentString(mimetype='text/plain')
+                docs.append((file_name, content))
+                continue
+
+            # Unsupported: Try text fallback
+            try:
+                content = f.GetContentString(mimetype='text/plain')
+                if content.strip():
+                    docs.append((file_name, content))
+            except:
+                pass
+
+        except Exception as e:
+            print(f"⚠️ Skipped {file_name}: {e}")
+
+    return docs
 
 # --------- Build Index ---------
 if st.button("⚡ Ingest and Build Index"):
@@ -194,6 +226,7 @@ if st.button("▶️ Run Query"):
             st.warning("⚠️ No Mistral API key provided — showing retrieved context only.")
             st.subheader("Retrieved Context")
             st.write("\n\n".join(context_texts))
+
 
 
 
