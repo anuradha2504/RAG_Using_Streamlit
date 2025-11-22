@@ -13,3 +13,9 @@ google-auth-oauthlib
 google-auth-httplib2
 docx2txt
 PyPDF2
+streamlit
+numpy
+sentence-transformers
+faiss-cpu
+pydrive2
+mistralai
