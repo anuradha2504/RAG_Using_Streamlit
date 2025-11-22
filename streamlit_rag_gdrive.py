@@ -1,6 +1,3 @@
-# streamlit_rag_gdrive.py
-# Streamlit app: Domain-specific RAG using MistralAI with Google Drive document ingestion (Service Account Auth)
-
 import os
 import streamlit as st
 import numpy as np
@@ -32,16 +29,12 @@ except Exception:
     GoogleDrive = None
     ServiceAccountCredentials = None
 
-# ----------------------- Utilities -----------------------
 
+# ----------------------- Google Drive Auth -----------------------
 def authenticate_gdrive():
-    """Authenticate Google Drive using service account credentials from Streamlit secrets."""
-    if GoogleAuth is None or ServiceAccountCredentials is None:
-        raise RuntimeError("PyDrive or oauth2client not installed. Please install them.")
-
-    scopes = ['https://www.googleapis.com/auth/drive']
-    # Read service account credentials from Streamlit secrets
+    scopes = ['https://www.googleapis.com/auth/drive.readonly']
     service_account_info = st.secrets["gcp_service_account"]
+
     creds = ServiceAccountCredentials.from_json_keyfile_dict(service_account_info, scopes)
 
     gauth = GoogleAuth()
@@ -49,17 +42,48 @@ def authenticate_gdrive():
     drive = GoogleDrive(gauth)
     return drive
 
-def fetch_gdrive_files(drive, folder_id: str, max_files=10) -> List[Tuple[str, str]]:
-    """Fetch up to max_files text files from a given Google Drive folder."""
-    file_list = drive.ListFile({'q': f"'{folder_id}' in parents and trashed=false"}).GetList()
+
+# ----------------------- Fetch Files -----------------------
+def fetch_gdrive_files(drive, folder_id: str, max_files=10):
+    """Fetch docs & extract text from supported formats."""
+    query = f"'{folder_id}' in parents and trashed=false"
+    file_list = drive.ListFile({'q': query}).GetList()
+
     docs = []
+
     for f in file_list[:max_files]:
-        if f['mimeType'] == 'text/plain':
-            content = f.GetContentString()
-            docs.append((f['title'], content))
+        name = f['title']
+        mime = f['mimeType']
+
+        try:
+            # Google Docs → convert to plain text
+            if mime == "application/vnd.google-apps.document":
+                content = f.GetContentString()
+                docs.append((name, content))
+                continue
+
+            # Plain text / CSV / JSON
+            if mime.startswith("text/") or mime == "application/json":
+                content = f.GetContentString()
+                docs.append((name, content))
+                continue
+
+            # PDF, DOCX fallback
+            try:
+                content = f.GetContentString(mimetype='text/plain')
+                if content.strip():
+                    docs.append((name, content))
+            except:
+                pass
+
+        except Exception as e:
+            print(f"⚠️ Skipped {name}: {e}")
+
     return docs
 
-def chunk_text(text, chunk_size=400, overlap=50):
+
+# ----------------------- Chunking -----------------------
+def chunk_text(text, chunk_size=600, overlap=100):
     chunks = []
     start = 0
     while start < len(text):
@@ -68,168 +92,134 @@ def chunk_text(text, chunk_size=400, overlap=50):
         start = max(end - overlap, end)
     return chunks
 
-def compute_embeddings_sbert(texts, model_name="all-MiniLM-L6-v2"):
+
+# ------------------ Embedding + Index ------------------
+def compute_embeddings(texts, model_name="all-MiniLM-L6-v2"):
     if SentenceTransformer is None:
-        raise RuntimeError("Install sentence-transformers to compute embeddings.")
+        raise RuntimeError("Install sentence-transformers")
+
     model = SentenceTransformer(model_name)
-    embs = model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
+    embs = model.encode(texts, convert_to_numpy=True)
     return embs.astype(np.float32)
+
 
 def build_faiss_index(embs):
     if faiss is None:
-        raise RuntimeError("Install faiss-cpu to use vector store.")
+        raise RuntimeError("Install faiss-cpu")
+
     d = embs.shape[1]
     index = faiss.IndexFlatL2(d)
     index.add(embs)
     return index
 
-def query_index(index, q_emb, top_k=4):
-    distances, indices = index.search(q_emb, top_k)
-    return distances, indices
 
-def call_mistral(api_key, prompt, model="mistral-medium"):
+def query_index(index, emb, top_k=4):
+    dists, idxs = index.search(emb, top_k)
+    return dists, idxs
+
+
+def call_mistral(api_key, prompt, model="mistral-small-latest"):
     if Mistral is None:
-        raise RuntimeError("Install mistralai to use Mistral API.")
+        raise RuntimeError("Install mistralai")
+
     client = Mistral(api_key=api_key)
     response = client.chat.complete(
-        model=model,
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant that answers using provided sources. If answer is not present, say you don't know."},
-            {"role": "user", "content": prompt}
-        ]
+        model=model, messages=[{"role": "user", "content": prompt}]
     )
-    return response.choices[0].message['content']
+    return response.choices[0].message["content"]
 
-# ----------------------- Streamlit UI -----------------------
 
-st.set_page_config(page_title="Domain-specific RAG (GDrive + Mistral)", layout="wide")
-st.title("📑 Domain-specific RAG — Google Drive + MistralAI")
+# ----------------------- UI -----------------------
+st.set_page_config(page_title="Google Drive RAG", layout="wide")
+st.title("📚 RAG from Google Drive — Mistral AI")
+
 
 with st.sidebar:
-    st.header("⚙️ Configuration")
-    MISTRAL_KEY = st.text_input("Mistral API Key", type="password")
-    top_k = st.number_input("Top-k retrieved chunks", min_value=1, max_value=10, value=4)
-    chunk_size = st.number_input("Chunk size", min_value=200, max_value=2000, value=600)
-    overlap = st.number_input("Chunk overlap", min_value=0, max_value=400, value=100)
-    folder_id = st.text_input("Google Drive Folder ID")
-    gdrive_fetch = st.button("📥 Fetch Documents from Google Drive")
+    MISTRAL_KEY = st.text_input("🔑 Mistral API Key", type="password")
+    folder_id = st.text_input("📂 Google Drive Folder ID")
+    top_k = st.slider("Top-K results", 1, 8, 4)
+    gdrive_fetch = st.button("📥 Fetch Google Drive Documents")
 
-# --------- Fetch Docs ---------
-def fetch_gdrive_files(drive, folder_id: str, max_files=10):
-    """Fetch and extract text content from most common file types in Google Drive folder."""
-    file_list = drive.ListFile({'q': f"'{folder_id}' in parents and trashed=false"}).GetList()
-    
-    docs = []
-    for f in file_list[:max_files]:
-        file_id = f['id']
-        file_name = f['title']
-        mime = f['mimeType']
 
-        try:
-            # Case 1: Google Docs (convert directly to text)
-            if mime == 'application/vnd.google-apps.document':
-                content = f.GetContentString()
-                docs.append((file_name, content))
-                continue
+# -------------------- Fetch & Display Docs --------------------
+if gdrive_fetch:
+    try:
+        drive = authenticate_gdrive()
+        docs = fetch_gdrive_files(drive, folder_id)
 
-            # Case 2: Plain text / Markdown / CSV etc.
-            if mime.startswith("text/") or mime == "application/json":
-                content = f.GetContentString()
-                docs.append((file_name, content))
-                continue
+        if len(docs) == 0:
+            st.error("❌ No readable docs found! Add Google Docs / PDF / TXT / DOCX etc.")
+        else:
+            st.success(f"📄 Loaded {len(docs)} document(s)")
+            for name, _ in docs:
+                st.write(f"➤ {name}")
+            st.session_state["docs"] = docs
 
-            # Case 3: PDF extraction
-            if mime == "application/pdf":
-                content = f.GetContentString(mimetype='text/plain')
-                if content.strip():
-                    docs.append((file_name, content))
-                continue
+    except Exception as e:
+        st.error(f"Google Drive Error: {e}")
 
-            # Case 4: Word (.docx)
-            if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-                content = f.GetContentString(mimetype='text/plain')
-                docs.append((file_name, content))
-                continue
 
-            # Unsupported: Try text fallback
-            try:
-                content = f.GetContentString(mimetype='text/plain')
-                if content.strip():
-                    docs.append((file_name, content))
-            except:
-                pass
-
-        except Exception as e:
-            print(f"⚠️ Skipped {file_name}: {e}")
-
-    return docs
-
-# --------- Build Index ---------
-if st.button("⚡ Ingest and Build Index"):
-    if 'raw_docs' not in st.session_state or len(st.session_state['raw_docs']) < 2:
-        st.error("Please fetch at least 2 documents first.")
+# -------------------- Indexing Btn --------------------
+if st.button("⚡ Build Vector Index"):
+    if "docs" not in st.session_state:
+        st.error("Please fetch docs first.")
     else:
-        raw_docs = st.session_state['raw_docs']
-        chunks = []
-        metadata = []
-        for doc_id, text in raw_docs:
-            for i, c in enumerate(chunk_text(text, chunk_size, overlap)):
+        docs = st.session_state["docs"]
+        chunks, meta = [], []
+
+        for title, text in docs:
+            for i, c in enumerate(chunk_text(text)):
                 chunks.append(c)
-                metadata.append({"source": doc_id, "chunk": i})
-        st.session_state['chunks'] = chunks
-        st.session_state['metadata'] = metadata
+                meta.append({"title": title, "chunk": i})
 
         try:
-            embs = compute_embeddings_sbert(chunks)
-            st.session_state['embs'] = embs
+            embs = compute_embeddings(chunks)
             index = build_faiss_index(embs)
-            st.session_state['index'] = index
-            st.success(f"✅ Built FAISS index with {len(chunks)} chunks.")
+            st.session_state.update({"embs": embs, "index": index,
+                                    "chunks": chunks, "meta": meta})
+            st.success(f"🎯 Indexed {len(chunks)} text chunks successfully!")
+
         except Exception as e:
-            st.error(f"❌ Embedding/Indexing error: {e}")
+            st.error(f"Embedding / Indexing Error: {e}")
 
-# --------- Query Section ---------
-st.header("🔎 Query")
-query = st.text_input("Enter your question")
 
-if st.button("▶️ Run Query"):
-    if 'index' not in st.session_state:
-        st.error("No index found. Fetch and ingest documents first.")
+# -------------------- Query Section --------------------
+st.subheader("🔍 Ask a Question")
+query = st.text_input("Type your question")
+
+if st.button("▶️ Search & Answer"):
+    if "index" not in st.session_state:
+        st.error("Build index first!")
     elif not query:
-        st.error("Please enter a query.")
+        st.warning("Enter a question")
     else:
-        q_emb = compute_embeddings_sbert([query])
-        distances, indices = query_index(st.session_state['index'], q_emb, top_k)
-        chunks = st.session_state['chunks']
-        metadata = st.session_state['metadata']
-        context_texts = []
-        for rank, hit in enumerate(indices[0]):
-            snippet = chunks[hit]
-            context_texts.append(f"Source: {metadata[hit]['source']} — {snippet}")
-            st.markdown(f"**Rank {rank+1} — Source:** {metadata[hit]['source']} (chunk {metadata[hit]['chunk']})")
-            st.code(snippet[:800])
+        q_emb = compute_embeddings([query])
+        dists, idxs = query_index(st.session_state["index"], q_emb, top_k)
 
-        prompt = "Use these sources to answer the question. Cite source numbers.\n\n"
-        for i, ctx in enumerate(context_texts):
-            prompt += f"[{i+1}] {ctx}\n\n"
-        prompt += f"User Question: {query}\nAnswer:"
+        chunks = st.session_state["chunks"]
+        meta = st.session_state["meta"]
+        context = []
 
-        if MISTRAL_KEY:
+        for i, idx in enumerate(idxs[0]):
+            src = meta[idx]["title"]
+            chk = meta[idx]["chunk"]
+            st.markdown(f"**Match {i+1}: {src} (chunk {chk})**")
+            snippet = chunks[idx]
+            context.append(snippet)
+            st.code(snippet[:500])
+
+        if MISTRAL_KEY.strip():
+            prompt = (
+                "Use only this context:\n\n" +
+                "\n\n---\n\n".join(context) +
+                f"\n\nUser Question: {query}\nAnswer:"
+            )
             try:
-                with st.spinner("🤖 Calling MistralAI..."):
-                    answer = call_mistral(MISTRAL_KEY, prompt)
+                answer = call_mistral(MISTRAL_KEY, prompt)
                 st.subheader("💡 Answer")
                 st.write(answer)
             except Exception as e:
-                st.error(f"❌ Mistral API error: {e}")
+                st.error(f"Mistral API Error: {e}")
         else:
-            st.warning("⚠️ No Mistral API key provided — showing retrieved context only.")
-            st.subheader("Retrieved Context")
-            st.write("\n\n".join(context_texts))
-
-
-
-
-
-
-
+            st.warning("Provide Mistral Key for AI answer — showing context only")
+            st.write("\n\n".join(context))
