@@ -119,12 +119,16 @@ if gdrive_fetch:
     try:
         drive = authenticate_gdrive()
         raw_docs = fetch_gdrive_files(drive, folder_id)
-        if len(raw_docs)<2:
-            st.error("Less than 2 documents found. Add more files to the folder.")
-           # st.success(f"✅ Fetched {len(raw_docs)} documents from Google Drive.")
+
+        if len(raw_docs) == 0:
+            st.error("❌ No documents found in the folder. Please add at least one file.")
         else:
-            st.success(f"✅ Fetched {len(raw_docs)} documents from Google Drive.")
+            st.success(f"✅ Fetched {len(raw_docs)} document(s) from Google Drive.")
             st.session_state['raw_docs'] = raw_docs
+
+            if len(raw_docs) < 2:
+                st.warning("⚠️ Only one document found. Recommendation: Add more files for better RAG performance.")
+
     except Exception as e:
         st.error(f"❌ Google Drive fetch failed: {e}")
 
@@ -190,6 +194,7 @@ if st.button("▶️ Run Query"):
             st.warning("⚠️ No Mistral API key provided — showing retrieved context only.")
             st.subheader("Retrieved Context")
             st.write("\n\n".join(context_texts))
+
 
 
 
